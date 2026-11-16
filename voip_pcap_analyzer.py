@@ -151,6 +151,10 @@ def iter_frames(path, info):
         info["format"] = "pcapng"
         yield from _iter_pcapng(f, info)
         return
+    elif head == b"#!rt":
+        info["format"] = "rtpdump"
+        yield from _iter_rtpdump(f, info)
+        return
     else:
         raise ValueError("Formato no reconocido (no es pcap ni pcapng). Si es .cap de otro "
                          "producto, conviértelo con editcap -F pcap.")
@@ -177,6 +181,45 @@ def iter_frames(path, info):
             break
         n += 1
         yield n, ts_s + ts_f / div, lt, data, orig
+
+
+def _iter_rtpdump(f, info):
+    """rtpdump / rtpplay (rtptools, 'Save RTP' de Wireshark): '#!rtpplay1.0 IP/puerto\\n' + RD_hdr_t + RD_packet_t*.
+
+    Solo guarda UN sentido de UN flujo. Se generan tramas IPv4/UDP sintéticas (linktype 101) para reutilizar el
+    resto del análisis. Como en rtptools y en 'RTP > Save as rtpdump' de Wireshark: la línea de texto es el DESTINO y
+    'source'/'port' de RD_hdr_t son el ORIGEN.
+    """
+    line = b"#!rt" + f.readline()
+    m = re.match(rb"#!rtpplay1\.0 ([0-9.]+)/(\d+)", line)
+    if not m:
+        raise ValueError("Cabecera rtpdump no reconocida (se esperaba '#!rtpplay1.0 IP/puerto').")
+    dst_ip, dst_port = socket.inet_aton(m.group(1).decode()), int(m.group(2))
+    hdr = f.read(16)
+    if len(hdr) < 16:
+        raise ValueError("rtpdump truncado: falta la cabecera binaria.")
+    t_sec, t_usec, src_raw, src_port = struct.unpack("!IIIH", hdr[:14])
+    src_ip = struct.pack("!I", src_raw)
+    info["snaplen"] = 65535
+    info["rtpdump"] = {"src": f"{socket.inet_ntoa(src_ip)}:{src_port}",
+                       "dst": f"{socket.inet_ntoa(dst_ip)}:{dst_port}"}
+    info["warnings"].append("rtpdump: contiene un solo sentido de un solo flujo RTP y nada de SIP; el origen se toma "
+                            "de la cabecera binaria (puede ser 0.0.0.0 si la herramienta no lo rellenó).")
+    start = t_sec + t_usec / 1e6
+    n = 0
+    while True:
+        ph = f.read(8)
+        if len(ph) < 8:
+            break
+        length, plen, off_ms = struct.unpack("!HHI", ph)
+        body = f.read(length - 8) if length >= 8 else b""
+        if len(body) < length - 8:
+            info["warnings"].append("rtpdump truncado al final.")
+            break
+        udp = struct.pack("!HHHH", src_port, dst_port, 8 + len(body), 0) + body
+        ip = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(udp), 0, 0, 64, 17, 0, src_ip, dst_ip) + udp
+        n += 1
+        yield n, start + off_ms / 1000.0, 101, ip, len(ip)
 
 
 def _iter_pcapng(f, info):
@@ -261,10 +304,15 @@ def l2_to_ip(lt, d):
             if et in (0x0800, 0x86DD):
                 return d[off:]
             return None
-        if lt == 113:
-            return d[16:]
-        if lt == 276:
-            return d[20:]
+        if lt in (113, 276):
+            # Linux cooked (tcpdump -i any). El protocolo puede ser 802.1Q: con '-i any' la misma trama aparece
+            # sin etiqueta (interfaz VLAN) y etiquetada (interfaz física/bond); tomar d[16:] a ciegas convierte la
+            # copia etiquetada en un "paquete IP" basura con IPs inventadas.
+            et, off = (struct.unpack("!H", d[14:16])[0], 16) if lt == 113 else (struct.unpack("!H", d[0:2])[0], 20)
+            while et in (0x8100, 0x88A8, 0x9100):
+                et = struct.unpack("!H", d[off + 2:off + 4])[0]
+                off += 4
+            return d[off:] if et in (0x0800, 0x86DD) else None
         if lt in (0, 108):
             return d[4:]
         if lt in (101, 12, 14, 228, 229):
@@ -694,6 +742,15 @@ class Analyzer:
         self.first_ts = self.last_ts = None
         self.ip_pk = Counter()
         self.info = {"warnings": [], "format": None, "snaplen": None}
+        # Duplicados de captura: misma trama vista dos veces (tcpdump -i any con VLAN/bond, span de ida y vuelta...)
+        self._dup = {}
+        self.dup_deltas = []
+        self.dup_pairs = Counter()
+        # IP-ID/TTL por paquete IPv4 de nivel 0: detecta pcaps reconstruidos (exports Homer/sngrep/HEP)
+        self.ipid_ttl = Counter()
+        # Huellas de payload RTP con voz, para detectar puentes (B2BUA que copia el audio de una pata a otra)
+        self.payload_fp = defaultdict(dict)
+        self.udp_other = 0
 
     # ---------------- IP ----------------
     def decode_ip(self, buf):
@@ -753,9 +810,10 @@ class Analyzer:
         for n, ts, lt, data, orig in iter_frames(path, self.info):
             self.stats["frames"] += 1
             self.linktypes[lt] += 1
-            if self.first_ts is None:
+            if self.first_ts is None or ts < self.first_ts:
                 self.first_ts = ts
-            self.last_ts = ts
+            if self.last_ts is None or ts > self.last_ts:
+                self.last_ts = ts
             ipb = l2_to_ip(lt, data)
             if ipb is None:
                 self.stats["non_ip"] += 1
@@ -771,8 +829,13 @@ class Analyzer:
         if r is None:
             return
         src, dst, proto, pkt = r
-        if (ipb[0] >> 4) == 4 and len(ipb) >= 9:
+        v4 = (ipb[0] >> 4) == 4
+        if proto == 17 and len(pkt) >= 8 and self._is_dup(ts, src, dst, ipb[4:6] if v4 else b"", pkt):
+            return
+        if v4 and len(ipb) >= 9:
             self.ttl[(src, depth > 0)][ipb[8]] += 1
+            if depth == 0:
+                self.ipid_ttl[(ipb[4:6], ipb[8])] += 1
         elif (ipb[0] >> 4) == 6 and len(ipb) >= 8:
             self.ttl[(src, depth > 0)][ipb[7]] += 1
         try:
@@ -793,6 +856,29 @@ class Analyzer:
                 self.gre(n, ts, src, dst, pkt, trunc, depth)
         except (struct.error, IndexError):
             self.stats["decode_errors"] += 1
+
+    DUP_WINDOW = 0.25   # s. Una retransmisión SIP real tarda >= T1 (500 ms) y el RTP nunca repite seq+payload.
+
+    def _is_dup(self, ts, src, dst, ident, pkt):
+        """True si es copia de un datagrama UDP ya visto (mismos IP-ID, puertos y payload; se ignoran TTL y checksums,
+        porque la copia saliente se captura antes del checksum offload)."""
+        body = pkt[8:]
+        if len(body) >= 12 and (body[0] >> 6) == 2 and not SIP_START.match(body[:12]):
+            ident = b""   # RTP: seq+ts+SSRC+payload ya identifican el paquete (sirve también entre pcap y rtpdump)
+        k = hash((src, dst, bytes(ident), bytes(pkt[:4]), bytes(body)))
+        prev = self._dup.get(k)
+        self._dup[k] = ts if prev is None else prev
+        if prev is not None and abs(ts - prev) <= self.DUP_WINDOW:
+            self.stats["dup_frames"] += 1
+            if len(self.dup_deltas) < 20000:
+                self.dup_deltas.append(abs(ts - prev))
+            self.dup_pairs[(src, dst)] += 1
+            return True
+        if prev is not None:
+            self._dup[k] = ts
+        if len(self._dup) > 200000:
+            self._dup = {kk: t for kk, t in self._dup.items() if ts - t <= self.DUP_WINDOW}
+        return False
 
     # ---------------- Encapsulaciones ----------------
     def decap_udp(self, n, ts, src, sp, dst, dp, pl, trunc, depth):
@@ -909,6 +995,7 @@ class Analyzer:
             return
         if sp in NON_RTP_PORTS or dp in NON_RTP_PORTS or sp in self.sip_ports or dp in self.sip_ports:
             return
+        self.udp_other += 1
         if len(pl) >= 8 and (pl[0] >> 6) == 2:
             pt = pl[1]
             if 192 <= pt <= 223:
@@ -955,6 +1042,12 @@ class Analyzer:
         st.sizes[plen] += 1
         if pt >= 96 and plen == 4 and len(st.events) < 5000:
             st.events.append((ts, pt, rts, pl[hl:hl + 4]))
+        if plen >= 80:
+            fp = self.payload_fp[(src, sp, dst, dp)]
+            if len(fp) < 6000:
+                body = pl[hl:hl + plen]
+                if len(set(body[:80])) > 8:   # descartar silencio/ruido de confort: no identifica nada
+                    fp.setdefault(hash(bytes(body)), ts)
         if pt in G711_SQ and plen >= 40 and (len(st.seq) % 2 == 0 or len(st.seq) < 30000) and len(st.lvl) < 30000:
             body = pl[hl:hl + plen]
             sq = G711_SQ[pt]
@@ -1370,14 +1463,26 @@ def analyze_other_dialog(cid, msgs, t0):
 def match_media(calls_info, an, t0):
     """Asocia streams RTP a llamadas usando SDP (IP:puerto) y ventana temporal."""
     stream_owner = {}
+    # Orígenes locales al punto de captura (TTL inicial intacto): un B2BUA/media server propio envía siempre desde
+    # el puerto de su SDP. Si sale de otro puerto hacia el mismo destino, ese RTP es de OTRA llamada. Para orígenes
+    # remotos no se aplica: un puerto distinto al del SDP es lo normal detrás de NAT.
+    local_like = {ip for (ip, inner), c in an.ttl.items() if not inner and c.most_common(1)[0][0] in (64, 128, 255)}
     for ci in calls_info:
         sdps = [s for s in ci["sdps"] if s["type"] in ("audio", "video") and s["port"]]
         t_start, t_end, _ = ci["window"]
         by_ipport = {}
         by_port = {}
+        own_ports = defaultdict(set)   # (owner, ip) -> puertos anunciados en sus SDP
         for s in sdps:
             by_ipport[(s["ip"], s["port"])] = s
             by_port.setdefault(s["port"], s)
+            own_ports[(s["owner"], s["ip"])].add(s["port"])
+
+        def foreign(ip, port, owner_other):
+            # El extremo es la IP de medios del otro lado pero desde un puerto que su SDP nunca anunció: es RTP de
+            # OTRA llamada del mismo equipo hacia el mismo destino (p. ej. el agente recibe varias llamadas en :4050).
+            ports = own_ports.get((owner_other, ip))
+            return ip in local_like and bool(ports) and port not in ports
         for key, st in an.rtp.items():
             if key in stream_owner:
                 continue
@@ -1394,7 +1499,12 @@ def match_media(calls_info, an, t0):
                 m = ("from", by_port[st.sport], "solo puerto (NAT/SBC)")
             if m:
                 rel_, s, how = m
-                sender = ("B" if s["owner"] == "A" else "A") if rel_ == "to" else s["owner"]
+                other = "B" if s["owner"] == "A" else "A"
+                if rel_ == "to" and foreign(st.src, st.sport, other):
+                    continue
+                if rel_ == "from" and foreign(st.dst, st.dport, other):
+                    continue
+                sender = other if rel_ == "to" else s["owner"]
                 stream_owner[key] = (ci["summary"]["call_id"], sender, how)
     return stream_owner
 
@@ -1530,7 +1640,14 @@ def media_findings(ci, streams, an, t0, rtcp):
     talk = (t_end - t_ans) if t_ans and t_end else 0
     holds = s.get("hold_events", [])
     if t_ans and talk >= 3:
-        if not audio:
+        if not audio and an.udp_other == 0 and not an.rtp:
+            F.append(finding("SIN_RTP", "info", "Llamada contestada: la captura no incluye medios (solo SIP)",
+                             f"Conversación de {talk:.1f}s. La captura no contiene NINGÚN paquete que no sea SIP (filtro de "
+                             "señalización, export de Homer/sngrep/HEP o siptrace): la ausencia de RTP no es evidencia de un "
+                             "problema de audio y no permite atribuir nada al plano de medios.", cid,
+                             hint="Si la queja es de audio, pedir captura con medios en el mismo punto: "
+                                  "tcpdump -i <iface> -s 0 -w llamada.pcap udp"))
+        elif not audio:
             F.append(finding("SIN_RTP", "critico", "Llamada contestada sin RTP en la captura",
                              f"Conversación de {talk:.1f}s sin ningún flujo RTP asociado. Puede ser ausencia real de audio o que el "
                              "punto de captura no ve el plano de medios (RTP por otro interfaz/SBC).", cid,
@@ -1542,14 +1659,18 @@ def media_findings(ci, streams, an, t0, rtcp):
             sdp_only = next((x for x in ci["sdps"] if x["owner"] == only and x["type"] == "audio"), None)
             det = (f"Solo se ve RTP enviado por {side_label(only)}. No llega/no se ve RTP de {side_label(miss)} "
                    f"durante {talk:.1f}s de conversación. ")
-            if sdp_only and sdp_only["ip"] and is_private(sdp_only["ip"]):
+            # La IP privada en el SDP solo delata NAT si el otro extremo está en Internet: entre dos privadas
+            # (LAN, VPN, VPC) es lo normal y la pista mandaría a buscar un NAT que no existe.
+            nat_hint = bool(sdp_only and sdp_only["ip"] and is_private(sdp_only["ip"])
+                            and sdp_miss and sdp_miss["ip"] and not is_private(sdp_miss["ip"]))
+            if nat_hint:
                 det += (f"{side_label(only)} anuncia IP privada {sdp_only['ip']} en su SDP: {side_label(miss)} probablemente "
                         "le envía el audio a esa IP inalcanzable (o no lo envía a la IP pública). ")
             if holds:
                 det += "Hay re-INVITEs de hold/sendonly que podrían explicarlo parcialmente. "
             F.append(finding("AUDIO_UNIDIRECCIONAL", "critico", "Audio unidireccional", det, cid,
                              suspect=f"{side_label(miss)} no envía o su RTP no llega al punto de captura"
-                                     + (f"; NAT de {side_label(only)}" if sdp_only and sdp_only['ip'] and is_private(sdp_only['ip']) else ""),
+                                     + (f"; NAT de {side_label(only)}" if nat_hint else ""),
                              hint="Contrastar con captura en el otro extremo. Si B envía pero no llega aquí: firewall/NAT en el camino. "
                                   "Si B no envía: B no recibió SDP válido o espera RTP primero (comedia/symmetric RTP)."))
     byflow = defaultdict(list)
@@ -1606,9 +1727,245 @@ def media_findings(ci, streams, an, t0, rtcp):
 # --------------------------------------------------------------------------------------
 # Informe
 # --------------------------------------------------------------------------------------
+def _fmt_offset(sec):
+    s = "+" if sec >= 0 else "-"
+    sec = abs(int(round(sec)))
+    return f"{s}{sec // 3600}h{(sec % 3600) // 60:02d}m{sec % 60:02d}s"
+
+
+def capture_integrity(an):
+    """Hallazgos sobre la propia captura. Devuelve (findings, flags)."""
+    F, flags = [], {}
+    total_v4 = sum(an.ipid_ttl.values())
+    srcs = {ip for (ip, inner) in an.ttl if not inner}
+    if total_v4 >= 4 and len(srcs) >= 2:
+        (ident, ttl), c = an.ipid_ttl.most_common(1)[0]
+        if c >= 0.95 * total_v4:
+            flags["synthetic"] = True
+            F.append(finding("PCAP_RECONSTRUIDO", "info",
+                             "La captura es un pcap reconstruido, no una captura de red real",
+                             f"Los {total_v4} paquetes IPv4 de {len(srcs)} orígenes distintos llevan el mismo IP-ID "
+                             f"(0x{ident.hex()}) y el mismo TTL ({ttl}): las cabeceras IP/UDP las ha inventado la herramienta "
+                             "que exportó la traza (Homer/HEP, sngrep, siptrace...). TTL, saltos, punto de captura y, a "
+                             "menudo, la hora del pcap NO son fiables; el contenido SIP sí.", None,
+                             hint="Para conclusiones de red o de medios, pedir captura tcpdump real en el equipo."))
+    if an.stats["sip"] and an.udp_other == 0 and not an.rtp:
+        flags["sip_only"] = True
+        F.append(finding("CAPTURA_SOLO_SIP", "info", "La captura solo contiene señalización SIP",
+                         "No hay ni un datagrama UDP que no sea SIP: se puede analizar el flujo de la llamada, tiempos, "
+                         "códecs y causas de liberación, pero NO el audio (unidireccional, cortes, calidad).", None))
+    dups = an.stats.get("dup_frames", 0)
+    if dups:
+        d = sorted(an.dup_deltas)
+        med = d[len(d) // 2] * 1000 if d else 0
+        pct = 100.0 * dups / max(an.stats["frames"], 1)
+        detail = (f"{dups} tramas ({pct:.0f}% del total) son copias exactas de otra (mismo IP-ID, puertos y payload; "
+                  f"desfase mediana {med:.1f} ms, máx {d[-1] * 1000:.1f} ms) y se han descartado antes del análisis. "
+                  "Típico de 'tcpdump -i any' en un equipo con VLAN/bond (la trama se ve en la interfaz lógica y en la "
+                  "física) o de un mirror que copia ida y vuelta. Sin descartarlas, el SIP aparece como retransmitido, "
+                  "el RTP duplica su cuenta de paquetes y el jitter sale falseado.")
+        if med >= 2:
+            detail += (f" Las copias llegan {med:.0f} ms desfasadas: si se mira la captura en Wireshark, el orden entre "
+                       "mensajes de distintos saltos puede parecer imposible (un proxy 'reenvía' antes de recibir).")
+        F.append(finding("DUPLICADOS_CAPTURA", "info", f"Tramas duplicadas por el método de captura ({pct:.0f}%)", detail,
+                         None, [{"frame": "-", "t": "-", "msg": f"{s} -> {t}", "note": f"{c} copias"}
+                                for (s, t), c in an.dup_pairs.most_common(3)],
+                         hint="Capturar en una sola interfaz (tcpdump -i eth0.<vlan>) o deduplicar con editcap -D 100."))
+    if an.info.get("rtpdump"):
+        F.append(finding("RTPDUMP_UN_SENTIDO", "info", "Fichero rtpdump: un solo sentido de un solo flujo",
+                         f"Flujo {an.info['rtpdump']['src']} -> {an.info['rtpdump']['dst']}. El formato guarda los tiempos "
+                         "con resolución de 1 ms, así que el jitter tiene un error de ±0,5 ms; pérdida, pausas, saltos de "
+                         "timestamp y contenido del audio sí son exactos. No contiene SIP ni el sentido contrario.", None,
+                         hint="Si se tiene el pcap de la misma llamada, analizar ambos juntos: voip_pcap_analyzer.py a.pcap b.rtp"))
+    return F, flags
+
+
+def clock_check(an, synthetic):
+    """Contrasta la hora del pcap con relojes embebidos en el SIP.
+
+    FreeSWITCH genera el o= de su SDP como epoch_actual - puerto_RTP (switch_core_media), así que
+    o_sess_id + puerto = hora del FS cuando creó el SDP. En capturas reales coincide con el pcap a ±1 s.
+    """
+    F, offset = [], None
+    refs, seen = [], set()
+    for m in an.sip_msgs:
+        sdp = m.get("sdp")
+        o = (sdp or {}).get("origin") or ""
+        p = o.split()
+        if len(p) < 2 or p[0] != "FreeSWITCH" or not p[1].isdigit() or p[1] in seen:
+            continue
+        port = next((x["port"] for x in sdp["media"] if x["type"] == "audio" and x["port"]), None)
+        if not port:
+            continue
+        seen.add(p[1])
+        refs.append((m["ts"] - (int(p[1]) + port), m))
+    refs = [r for r in refs if abs(r[0]) < 3 * 86400]
+    if refs:
+        offs = sorted(r[0] for r in refs)
+        med = offs[len(offs) // 2]
+        consistent = offs[-1] - offs[0] < 10
+        if abs(med) > 120 and consistent:
+            offset = med
+            hours = round(med / 3600)
+            tz = abs(med - hours * 3600) < 120 and hours != 0
+            m0 = refs[0][1]
+            F.append(finding(
+                "RELOJ_CAPTURA_DESFASADO", "medio",
+                f"La hora del pcap está desplazada {_fmt_offset(med)} respecto a FreeSWITCH",
+                (f"{len(refs)} SDP de FreeSWITCH (o= + puerto RTP = hora del FS) dan el mismo desfase. " if len(refs) > 1 else
+                 "El SDP de FreeSWITCH (o= + puerto RTP = hora del FS al crearlo) da ese desfase. ")
+                + (f"Es un número entero de horas: la herramienta guardó la hora local (UTC{hours:+d}) como si fuera UTC. "
+                   if tz else "El reloj del equipo que capturó no está sincronizado. ")
+                + f"Hora real estimada de inicio: {fmt_utc(an.first_ts - med)}. Al cruzar con logs/CDR usar esa hora, "
+                "no la que muestra el pcap.", None,
+                [{"frame": m0["frame"], "t": "-", "msg": m0["first_line"][:40], "note": f"o= {m0['sdp']['origin'][:40]}"}],
+                suspect="herramienta de export / reloj del capturador"))
+    ref_ok = offset is not None or not synthetic   # en un pcap reconstruido sin referencia FS la hora no vale
+    shift = offset or 0
+    done = set()
+    if ref_ok:
+        for m in an.sip_msgs:
+            dh = re.search(r"\nDate:\s*([^\r\n]+)", m["headers_raw"], re.I)
+            who = m["user_agent"] or m["src"]
+            if not dh or who in done:
+                continue
+            try:
+                from email.utils import parsedate_to_datetime
+                dt = parsedate_to_datetime(dh.group(1).strip()).timestamp()
+            except (TypeError, ValueError, IndexError):
+                continue
+            diff = dt - (m["ts"] - shift)
+            done.add(who)
+            if abs(diff) > 60:
+                F.append(finding(
+                    "RELOJ_EQUIPO_DESFASADO", "bajo",
+                    f"El reloj de {m['user_agent'] or m['src']} va {_fmt_offset(diff)} "
+                    f"{'adelantado' if diff > 0 else 'atrasado'}",
+                    f"Cabecera Date: '{dh.group(1).strip()}' en #{m['frame']} frente a la hora "
+                    f"{'de FreeSWITCH' if offset is not None else 'del pcap'}. Sus logs/CDR estarán desplazados lo mismo; "
+                    "NTP no sincronizado.", None,
+                    [{"frame": m["frame"], "t": "-", "msg": m["first_line"][:40], "note": dh.group(1).strip()}],
+                    suspect=f"{m['src']} (NTP)"))
+    return F, offset
+
+
+LEG_HEADERS = ("x-fs-callid", "x-fs-other-leg-call-id", "x-other-leg-call-id", "x-original-call-id", "x-orig-call-id")
+
+
+def leg_findings(calls_info):
+    F = []
+    cids = {ci["summary"]["call_id"] for ci in calls_info}
+    seen = set()
+    for ci in calls_info:
+        cid = ci["summary"]["call_id"]
+        for m in ci["msgs"]:
+            for h in LEG_HEADERS:
+                other = (m.get("x_headers") or {}).get(h)
+                if not other or other == cid or (cid, other) in seen:
+                    continue
+                seen.add((cid, other))
+                if other in cids:
+                    F.append(finding("PATAS_RELACIONADAS", "info", f"Las llamadas {other} y {cid} son patas de la misma llamada",
+                                     f"La cabecera {h} de {cid} apunta a {other}. Leer ambas como un único recorrido "
+                                     "extremo a extremo.", cid))
+                else:
+                    F.append(finding("PATA_EXTERNA", "info", f"Esta llamada es una pata de {other}, que no está en la captura",
+                                     f"La cabecera {h} de {cid} referencia el Call-ID {other}. Lo que pase en la otra pata "
+                                     "(códecs, audio, quién cuelga) no se ve aquí.", cid,
+                                     hint="Si se tiene la otra captura, analizar ambas juntas: voip_pcap_analyzer.py pata1.pcap pata2.pcap"))
+    return F
+
+
+def find_bridges(an, min_common=20):
+    """Puentes de medios: un equipo reenvía sin transcodificar el audio que recibe de un extremo hacia otro.
+    Se detectan por payloads RTP idénticos (con voz) entrando y saliendo del mismo host."""
+    fps = {k: v for k, v in an.payload_fp.items() if len(v) >= 30}
+    out = []
+    for a, fa in fps.items():
+        for b, fb in fps.items():
+            if a == b or b[0] != a[2] or (b[2], b[3]) == (a[0], a[1]):
+                continue
+            common = fa.keys() & fb.keys()
+            if len(common) < min_common or len(common) < 0.3 * min(len(fa), len(fb)):
+                continue
+            lat = sorted(fb[h] - fa[h] for h in common)
+            out.append({"in": a, "out": b, "common": len(common), "ratio": round(len(common) / len(fa), 2),
+                        "lat_ms": round(lat[len(lat) // 2] * 1000, 1),
+                        "lat_p10_ms": round(lat[len(lat) // 10] * 1000, 1), "lat_p90_ms": round(lat[9 * len(lat) // 10] * 1000, 1)})
+    return out
+
+
+def bridge_findings(an, bridges, streams_all, findings):
+    F = []
+    rec_by = {(x["src"], x["sport"], x["dst"], x["dport"]): x for x in streams_all}
+    live = {(st.src, st.sport, st.dst, st.dport) for st in an.rtp.values() if len(st.seq) >= 50}
+    for br in bridges:
+        (P, pp, H, hp), (_, hq, R, rq) = br["in"], br["out"]
+        ra, rb = rec_by.get(br["in"]), rec_by.get(br["out"])
+        ca, cb = (ra or {}).get("call_id"), (rb or {}).get("call_id")
+        realtime = br["lat_p90_ms"] < 1000
+        F.append(finding("PUENTE_MEDIOS", "info",
+                         f"{H} reenvía el audio de {P} hacia {R} (mismos payloads, retardo {br['lat_ms']} ms)",
+                         f"{br['common']} paquetes con voz idénticos en {ep(P, pp)} -> {ep(H, hp)} y {ep(H, hq)} -> {ep(R, rq)}: "
+                         f"{H} hace de puente sin transcodificar entre "
+                         + (f"las llamadas {ca} y {cb}. " if ca and cb and ca != cb else "esas dos patas. ")
+                         + ("Reenvío en tiempo real." if realtime else
+                            f"Retardo p10-p90 {br['lat_p10_ms']}-{br['lat_p90_ms']} ms: no es un puente en tiempo real "
+                            "(grabación y reproducción, eco, buffer de conferencia/escucha)."),
+                         ca or cb))
+        back_in = (R, rq, H, hq) in live
+        back_out = (H, hp, P, pp) in live
+        if realtime and not back_in and not back_out:
+            note = (f" Correlación de puente: {H} sí reenvía a {R} el audio de {P}, pero {R} no envía ni un paquete RTP a "
+                    f"{ep(H, hq)}; por eso {H} tampoco tiene nada que enviar a {P}. El origen está en {R} o en el camino "
+                    f"{R} -> {H}, no en {P} ni en un NAT de {H}.")
+            F.append(finding("UNIDIRECCIONAL_POR_PUENTE", "critico",
+                             f"Audio unidireccional: {R} no envía audio y el puente {H} no tiene nada que devolver a {P}",
+                             note.strip(), cb or ca,
+                             [{"frame": rb["first_frame"] if rb else "-", "t": "-", "msg": "RTP reenviado",
+                               "note": f"{ep(H, hq)} -> {ep(R, rq)}"}],
+                             suspect=f"{R} (no emite RTP) o firewall/ruta {R} -> {H}",
+                             hint=f"Capturar en {R} o en su red: ¿sale RTP hacia {ep(H, hq)}? Softphone: permisos de micrófono, "
+                                  "mute, dispositivo de audio, firewall local/VPN que bloquea UDP saliente."))
+            for f_ in findings:
+                if f_["code"] == "AUDIO_UNIDIRECCIONAL" and f_["call_id"] in (ca, cb):
+                    f_["detail"] = (f_["detail"].rstrip() + f" Causa común con la otra pata: {R} no envía RTP al puente "
+                                    f"{H} (ver UNIDIRECCIONAL_POR_PUENTE).")
+                    f_["suspect"] = f"{R} (ver UNIDIRECCIONAL_POR_PUENTE)"
+        elif realtime and back_in and not back_out:
+            F.append(finding("PUENTE_NO_REENVIA", "alto",
+                             f"{H} recibe audio de {R} pero no lo reenvía a {P}",
+                             f"El sentido {P} -> {R} pasa por el puente, pero el contrario se queda en {H}: llega RTP a "
+                             f"{ep(H, hq)} y no sale nada hacia {ep(P, pp)}.", ca or cb, suspect=f"{H} (puente/B2BUA)"))
+    return F
+
+
+def _sort_stream(st):
+    """Reordena por llegada un stream construido a partir de varios ficheros."""
+    idx = sorted(range(len(st.arr)), key=st.arr.__getitem__)
+    if all(idx[i] == i for i in range(len(idx))):
+        return
+    st.arr = array("d", (st.arr[i] for i in idx))
+    st.seq = array("H", (st.seq[i] for i in idx))
+    st.rts = array("I", (st.rts[i] for i in idx))
+    st.ptarr = array("B", (st.ptarr[i] for i in idx))
+    st.lvl.sort(key=lambda x: x[0])
+    st.events.sort(key=lambda x: x[0])
+
+
 def analyze(path, sip_ports, local_ips, acdr_ports=(925,), vxlan_ports=(4789, 8472)):
+    paths = [path] if isinstance(path, str) else list(path)
     an = Analyzer(sip_ports, acdr_ports, vxlan_ports)
-    an.run(path)
+    formats = []
+    for p in paths:
+        an.info["format"] = None
+        an.run(p)
+        formats.append(an.info["format"])
+    an.info["format"] = " + ".join(dict.fromkeys(f for f in formats if f))
+    if len(paths) > 1:
+        for st in an.rtp.values():
+            _sort_stream(st)
+    path = " + ".join(paths)
     t0 = an.first_ts or 0
     calls = build_calls(an)
     calls_info, others, findings = [], [], []
@@ -1682,6 +2039,7 @@ def analyze(path, sip_ports, local_ips, acdr_ports=(925,), vxlan_ports=(4789, 84
         unexpected = sorted(p for p in st.pts if negotiated and p not in negotiated and p != 13)
         rec = {"call_id": cid, "sender": sender, "match": how, "media": media,
                "flow": f"{ep(st.src, st.sport)} -> {ep(st.dst, st.dport)}", "src": st.src, "dst": st.dst,
+               "sport": st.sport, "dport": st.dport,
                "ssrc": f"0x{st.ssrc:08X}", "codec": codec, "clock": clock, "pts": dict(st.pts),
                "unexpected_pt": unexpected, "start": st.arr[0], "end": st.arr[-1],
                "first_frame": st.first_frame, "last_frame": st.last_frame, "dtmf_rfc2833": digits,
@@ -1703,6 +2061,8 @@ def analyze(path, sip_ports, local_ips, acdr_ports=(925,), vxlan_ports=(4789, 84
         findings += stream_findings(x, f"{x['src']}", t0)
     eps = {(x["src"], int(x["flow"].split(" -> ")[0].rsplit(":", 1)[1])): x for x in unmatched}
     for x in unmatched:
+        if an.info.get("rtpdump"):
+            break   # rtpdump guarda por diseño un solo sentido: no es un síntoma
         dst_ep = x["flow"].split(" -> ")[1]
         dip, dport = dst_ep.rsplit(":", 1)
         dip = dip.strip("[]")
@@ -1716,6 +2076,13 @@ def analyze(path, sip_ports, local_ips, acdr_ports=(925,), vxlan_ports=(4789, 84
                                     suspect=f"{dip} o el filtro de captura"))
 
     # Hallazgos globales
+    integ, cflags = capture_integrity(an)
+    findings += integ
+    ck, clock_offset = clock_check(an, cflags.get("synthetic"))
+    findings += ck
+    findings += leg_findings(calls_info)
+    bridges = find_bridges(an)
+    findings += bridge_findings(an, bridges, streams_all, findings)
     icmp_g = OrderedDict()
     for r in an.icmp:
         k = (r["from"], r["desc"], r.get("orig_src"), r.get("orig_dst"), r.get("orig_dport"))
@@ -1745,7 +2112,8 @@ def analyze(path, sip_ports, local_ips, acdr_ports=(925,), vxlan_ports=(4789, 84
         findings.append(finding("SOLO_RTP", "info", "La captura solo contiene medios (RTP), sin señalización SIP",
                                 "Se puede medir calidad (pérdida, jitter, pausas, DTMF), pero no cómo empezó/terminó la llamada, "
                                 "quién colgó ni la negociación SDP. Si el SIP va por un puerto no estándar, repetir con --sip-port.",
-                                None, hint="Capturar SIP y RTP juntos: tcpdump -i any -s 0 -w llamada.pcap 'udp or tcp port 5060'"))
+                                None, hint="Capturar SIP y RTP juntos en la interfaz de servicio (no -i any si hay VLAN/bond, duplica tramas): "
+                                     "tcpdump -i <iface> -s 0 -w llamada.pcap 'udp or tcp port 5060'"))
     elif an.stats["sip"] == 0:
         findings.append(finding("SIN_SIP", "alto", "No se encontró señalización SIP ni RTP",
                                 "Puede estar en puertos no estándar (usar --sip-port), cifrada (TLS), encapsulada en un formato no "
@@ -1814,6 +2182,12 @@ def analyze(path, sip_ports, local_ips, acdr_ports=(925,), vxlan_ports=(4789, 84
             capture_basis = (f"indeterminado: la IP más presente ({capture_host}) no emite ningún paquete y ningún TTL es "
                              "local; la captura es de un punto intermedio (router/CPE/mirror) en el camino")
             capture_host = "indeterminado (punto intermedio)"
+    if an.info.get("rtpdump"):
+        capture_host = "no aplica"
+        capture_basis = "rtpdump (sin cabeceras IP reales)"
+    elif cflags.get("synthetic"):
+        capture_host = "no determinable"
+        capture_basis = "pcap reconstruido (IP-ID/TTL inventados por la herramienta de export)"
     for ip in hosts:
         if ip in ttl_info:
             hosts[ip]["ttl"] = ttl_info[ip]["ttl"]
@@ -1903,6 +2277,9 @@ def analyze(path, sip_ports, local_ips, acdr_ports=(925,), vxlan_ports=(4789, 84
         "duration_s": round((an.last_ts or 0) - t0, 3), "linktypes": dict(an.linktypes),
         "snaplen": an.info["snaplen"], "warnings": an.info["warnings"], "stats": dict(an.stats),
         "probable_capture_host": capture_host, "capture_basis": capture_basis,
+        "capture_flags": cflags, "clock_offset_s": clock_offset,
+        "real_start_utc": fmt_utc(an.first_ts - clock_offset) if clock_offset is not None else None,
+        "bridges": [{**b, "in": "%s:%s -> %s:%s" % b["in"], "out": "%s:%s -> %s:%s" % b["out"]} for b in bridges],
         "encapsulation": sorted(an.encap), "acdr_trace_points": {f"tp{k[0]}/mt{k[1]}": v for k, v in an.acdr_types.items()},
         "hosts": hosts, "local_ips": sorted(local_ips),
         "totals": {"invite_calls": len(calls_info), "answered": sum(1 for c in calls_info if c["summary"]["answered"]),
@@ -1981,12 +2358,16 @@ def print_report(r, ladder_all, only_call, max_calls):
     P("=" * 100)
     P(f"Archivo: {r['file']}  formato: {r['format']}  tramas: {r['frames']}  snaplen: {r['snaplen']}")
     P(f"Inicio: {r['start_utc']}   Fin: {r['end_utc']}   Duración: {r['duration_s']} s")
+    if r.get("clock_offset_s") is not None:
+        P(f"AVISO RELOJ: el pcap está desplazado {_fmt_offset(r['clock_offset_s'])}; hora real estimada de inicio "
+          f"{r['real_start_utc']} (las horas t= del informe son relativas y sí valen)")
     t = r["totals"]
     P(f"Llamadas INVITE: {t['invite_calls']} (contestadas {t['answered']})  respuestas finales: {t['final_status_counts']}")
     P(f"Otros diálogos: {t['other_dialogs']}  Streams RTP: {t['rtp_streams']}  Informes RTCP: {t['rtcp_reports']}")
     s = r["stats"]
     P(f"SIP: {s.get('sip', 0)} msgs | UDP {s.get('udp', 0)} | TCP {s.get('tcp', 0)} | fragmentos IP {s.get('ip_fragments', 0)} "
-      f"(reensamblados {s.get('ip_reassembled', 0)}) | HEP {s.get('hep3', 0)} | keepalives {s.get('sip_keepalive', 0)}")
+      f"(reensamblados {s.get('ip_reassembled', 0)}) | HEP {s.get('hep3', 0)} | keepalives {s.get('sip_keepalive', 0)}"
+      + (f" | duplicados descartados {s['dup_frames']}" if s.get("dup_frames") else ""))
     for w in r["warnings"]:
         P(f"AVISO: {w}")
     for e in r["encapsulation"]:
@@ -2045,7 +2426,7 @@ def print_report(r, ladder_all, only_call, max_calls):
         P(f"  B (llamado) : {c['B']['ip']}:{c['B']['port']} UA={c['B']['user_agent']}")
         if len(c["hops"]) > 1:
             P(f"  Saltos INVITE vistos: {c['hops']}")
-        P(f"  100 Trying: {c['t_100_ms']} ms | PDD (->{c['first_18x']}): {c['pdd_s']} s | final: {c['final_status']} "
+        P(f"  100 Trying: {c['t_100_ms']} ms | {"PDD (->" + str(c['first_18x']) + "): " + str(c['pdd_s']) + " s" if c['first_18x'] else "PDD: sin 18x (respuesta final directa)"} | final: {c['final_status']} "
           f"{c['final_reason_phrase'] or ''} de {c['final_from']} | contestada en {c['t_answer_s']} s | ACK al 2xx: {c['ack_for_2xx']}")
         if c.get("bye_by"):
             P(f"  BYE por {c['bye_by']} ({c['bye_src']}) tras {c.get('duration_s')} s; respuesta {c['bye_response']}; "
@@ -2092,7 +2473,8 @@ def print_report(r, ladder_all, only_call, max_calls):
 
 def main():
     ap = argparse.ArgumentParser(description="Analizador VoIP de capturas pcap/pcapng (SIP/SDP/RTP/RTCP)")
-    ap.add_argument("pcap")
+    ap.add_argument("pcap", nargs="+", help="Una o varias capturas (pcap/pcapng/.gz/rtpdump). Con varias se analizan "
+                                            "juntas: útil para las dos patas de una llamada o un rtpdump + su pcap")
     ap.add_argument("--json", help="Ruta para escribir el resultado completo en JSON")
     ap.add_argument("--ladder", action="store_true", help="Imprimir la escalera SIP de todas las llamadas detalladas")
     ap.add_argument("--call", help="Mostrar solo esta llamada (Call-ID)")
