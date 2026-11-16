@@ -1810,6 +1810,10 @@ def analyze(path, sip_ports, local_ips, acdr_ports=(925,), vxlan_ports=(4789, 84
     else:
         capture_host = an.ip_pk.most_common(1)[0][0] if an.ip_pk else None
         capture_basis = "IP más presente (sin TTL inicial concluyente: captura en un punto intermedio o mirror)"
+        if capture_host and capture_host not in ttl_info:
+            capture_basis = (f"indeterminado: la IP más presente ({capture_host}) no emite ningún paquete y ningún TTL es "
+                             "local; la captura es de un punto intermedio (router/CPE/mirror) en el camino")
+            capture_host = "indeterminado (punto intermedio)"
     for ip in hosts:
         if ip in ttl_info:
             hosts[ip]["ttl"] = ttl_info[ip]["ttl"]
@@ -1827,6 +1831,70 @@ def analyze(path, sip_ports, local_ips, acdr_ports=(925,), vxlan_ports=(4789, 84
                                     [{"frame": x["first_frame"], "t": round(x["start"] - t0, 3), "msg": "RTP", "note": x["flow"]}],
                                     suspect=f"{x['src']} (temporización del emisor)",
                                     hint="Windows: timeBeginPeriod(1)/resolución de temporizador alta en la app; fax: usar T.38."))
+    # --- Hosts mudos: reciben SIP pero no emiten ningún paquete en toda la captura ---
+    senders = {ip for (ip, _inner) in an.ttl}
+    sip_rx = Counter(m["dst"] for m in an.sip_msgs if m["type"] == "request")
+    mute = [(ip, c) for ip, c in sip_rx.most_common() if c >= 10 and ip not in senders]
+    mute_ips = {ip for ip, _ in mute}
+    retx_inv = sum(1 for m in an.sip_msgs if m["type"] == "request" and m.get("method") == "INVITE"
+                   and m["dst"] in mute_ips and m.get("retrans"))
+    if mute:
+        others_bidir = [ip for ip in senders if ip not in {x for x, _ in mute}]
+        findings.append(finding(
+            "HOST_SIP_MUDO", "critico",
+            f"{len(mute)} destino(s) reciben SIP y no emiten ni un paquete en toda la captura: "
+            + ", ".join(f"{ip} ({c} peticiones)" for ip, c in mute[:6]),
+            "Ninguna respuesta SIP, ningún RTP, ningún ICMP desde esos hosts. "
+            + (f"Los emisores reintentan los INVITE ({retx_inv} retransmisiones hacia ellos): tampoco a ellos "
+               "les llega respuesta, así que no es solo que la captura no la vea. " if retx_inv else "")
+            + ("La captura sí registra tráfico en ambos sentidos para otros hosts, lo que descarta un filtro solo "
+               "entrante en el punto de captura. " if others_bidir else "")
+            + "Causas típicas: plataforma o servicio SIP caído, IP no levantada, firewall/ACL que descarta en silencio, "
+              "ruta de vuelta inexistente o asimétrica.", None,
+            [{"frame": "-", "t": "-", "msg": f"{ip}: {c} peticiones recibidas, 0 paquetes emitidos", "note": ""} for ip, c in mute[:6]],
+            suspect=", ".join(ip for ip, _ in mute[:6]) + " (o lo que hay entre el punto de captura y ellos)",
+            hint="Comprobar en esos hosts que el servicio escucha (ss -lunp | grep 5060), capturar en ellos mismos, revisar "
+                 "rutas/firewall entre el punto de captura y la plataforma."))
+    # --- Agrupar hallazgos repetidos por llamada (patrones masivos) ---
+    groups = OrderedDict()
+    for f_ in findings:
+        groups.setdefault((f_["code"], f_["title"], f_["suspect"]) if f_["call_id"] else id(f_), []).append(f_)
+    collapsed = []
+    for k, fs in groups.items():
+        if isinstance(k, tuple) and len(fs) >= 3:
+            n_calls = len(calls_info) or 1
+            g = dict(fs[0])
+            g["title"] = f"{fs[0]['title']} — patrón en {len(fs)} llamadas ({round(100 * len(fs) / n_calls)}% del total)"
+            g["detail"] = (fs[0]["detail"] + f" Se repite en {len(fs)} llamadas; ejemplos de Call-ID: "
+                           + ", ".join(x["call_id"] for x in fs[:3]) + ".")
+            g["call_id"] = None
+            g["evidence"] = [e for x in fs[:3] for e in x["evidence"][:1]]
+            g["grouped_call_ids"] = [x["call_id"] for x in fs]
+            collapsed.append(g)
+        else:
+            collapsed.extend(fs)
+    findings = collapsed
+    # --- Resumen por destino (INVITE y OPTIONS) ---
+    by_dst = OrderedDict()
+    for ci in calls_info:
+        s_ = ci["summary"]
+        d = by_dst.setdefault(s_["B"]["ip"], {"invites": 0, "answered": 0, "unanswered": 0, "codes": Counter(),
+                                               "options_sent": 0, "options_answered": 0})
+        d["invites"] += 1
+        if s_["answered"]:
+            d["answered"] += 1
+        elif s_["final_status"] is None:
+            d["unanswered"] += 1
+        else:
+            d["codes"][s_["final_status"]] += 1
+    for o in others:
+        if o["method"] == "OPTIONS":
+            dip = o["dst"].rsplit(":", 1)[0].strip("[]")
+            d = by_dst.setdefault(dip, {"invites": 0, "answered": 0, "unanswered": 0, "codes": Counter(),
+                                        "options_sent": 0, "options_answered": 0})
+            d["options_sent"] += 1
+            d["options_answered"] += 1 if o["final_status"] else 0
+    dest_summary = {ip: {**v, "codes": dict(v["codes"]), "emits_packets": ip in senders} for ip, v in by_dst.items()}
     findings.sort(key=lambda f: (SEV_ORDER[f["severity"]], f["call_id"] or ""))
     status_c = Counter(ci["summary"]["final_status"] for ci in calls_info)
     result = {
@@ -1842,6 +1910,7 @@ def analyze(path, sip_ports, local_ips, acdr_ports=(925,), vxlan_ports=(4789, 84
                    "other_dialogs": dict(Counter(o["method"] for o in others)), "rtp_streams": len(streams_all),
                    "rtcp_reports": len(an.rtcp)},
         "findings": findings, "calls": [], "other_dialogs": others[:500], "options_summary": opt_sum,
+        "destination_summary": dest_summary,
         "rtp_streams": [], "rtcp": an.rtcp[:500], "icmp": an.icmp[:200],
     }
     for ci in calls_info:
@@ -1930,6 +1999,12 @@ def print_report(r, ladder_all, only_call, max_calls):
         P(f"  {ip:<40} paquetes={h['packets_sip_rtp']:<7} {'privada' if h['private'] else 'pública':<8} TTL={h.get('ttl', '-'):<4}"
           f"{' LOCAL' if h['local'] else ''} UA={'; '.join(h['user_agents']) or '-'}")
 
+    if r.get("destination_summary"):
+        P("\nResumen por destino:")
+        for ip, d in list(r["destination_summary"].items())[:15]:
+            P(f"  {ip:<40} INVITE={d['invites']:<5} contestadas={d['answered']:<4} sin_respuesta={d['unanswered']:<4} "
+              f"fallos={d['codes'] or '-'}  OPTIONS={d['options_answered']}/{d['options_sent']} respondidos  "
+              f"{'emite paquetes' if d['emits_packets'] else 'NO EMITE NINGÚN PAQUETE'}")
     P("\n" + "=" * 100)
     P("HALLAZGOS (por severidad)")
     P("=" * 100)
